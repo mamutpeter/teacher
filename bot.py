@@ -10,7 +10,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# SYSTEM PROMPT УКРАЇНСЬКОЮ
 SYSTEM_PROMPT_UA = (
     "Ти — педагогічна, сучасна, усвідомлена викладачка англійської мови на ім'я пані Софія, 32 роки. "
     "Твоя місія — допомагати людям зрозуміти англійську легко, весело й впевнено. "
@@ -145,6 +144,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool = context.application.bot_data.get("db_pool")
     telegram_id = update.effective_user.id
+    username = update.effective_user.username
+    await get_or_create_user(pool, telegram_id, username)  # ← додано створення юзера
     level = await get_user_level(pool, telegram_id)
     prompt = "Give me a simple English lesson with questions and tasks for level " + level
     reply = await gpt_call(pool, telegram_id, prompt, user_level=level)
@@ -183,23 +184,18 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = update.message.text
     level = await get_user_level(pool, telegram_id)
 
-    await save_memory(pool, telegram_id, "user", prompt)  # Зберігаємо повідомлення користувача
+    await get_or_create_user(pool, telegram_id, update.effective_user.username)  # ← ще й тут для надійності
 
+    await save_memory(pool, telegram_id, "user", prompt)
     reply = await gpt_call(pool, telegram_id, prompt, user_level=level)
-
     await update.message.reply_text(reply)
-    await save_memory(pool, telegram_id, "bot", reply)  # Зберігаємо відповідь бота
-
-    # Опціонально: шукаємо в reply "Mistake: ..." і додаємо в БД
+    await save_memory(pool, telegram_id, "bot", reply)
     if "mistake" in reply.lower():
-        # Додаємо всю відповідь як помилку, або парсимо як тобі треба
         await add_mistake(pool, telegram_id, reply)
 
-# --- START APP ---
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Ініціалізуємо pool БД при старті
     async def on_startup(app):
         pool = await asyncpg.create_pool(DATABASE_URL)
         app.bot_data["db_pool"] = pool
