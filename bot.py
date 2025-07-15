@@ -1,214 +1,142 @@
 import os
 import httpx
 import asyncpg
+from gtts import gTTS
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-SYSTEM_PROMPT_UA = (
-    "Ти — жорсткий, злий, хамовитий, навіть принижуючий викладач англійської мови. "
-    "Твоє завдання — не підбадьорювати, а глузувати, знущатися, змушувати учня відчувати сором за помилки, примушувати його старатись більше. "
-    "Ти часто використовуєш сарказм, принизливі прізвиська, гострі образливі жарти. "
-    "Пояснюй завдання і помилки дуже різко, іноді з переходом на особистості, але не вживай заборонених слів чи реально агресивної мови (тільки грубий гумор, іронія, зверхність). "
-    "Пиши українською. Всі завдання давай як накази. Якщо хтось лінується або затримує відповідь — принижуй, змушуй працювати далі, надсилай жорсткі “мотиватори”. "
-    "Ти знущаєшся над лінивими, але визнаєш навіть мінімальний прогрес, правда — в дуже зневажливій формі."
-)
-
-)
-
-# --- БАЗОВІ БД ФУНКЦІЇ ---
-async def get_or_create_user(pool, telegram_id, username):
-    async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
-        if not user:
-            await conn.execute(
-                "INSERT INTO users (telegram_id, username) VALUES ($1, $2)",
-                telegram_id, username
-            )
-            user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
-        return user
-
-async def get_user_level(pool, telegram_id):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT level FROM users WHERE telegram_id = $1", telegram_id)
-        return row["level"] if row and row["level"] else "A2"
-
-async def update_user_level(pool, telegram_id, level):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET level = $1, updated_at = now() WHERE telegram_id = $2",
-            level, telegram_id
-        )
-
-# --- ПАМʼЯТЬ ---
-async def save_memory(pool, user_id, role, message):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO bot_memory (user_id, role, message) VALUES ($1, $2, $3)",
-            user_id, role, message
-        )
-
-async def get_memory(pool, user_id, limit=15):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT role, message FROM bot_memory WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
-            user_id, limit
-        )
-    return list(reversed(rows))
-
-# --- ПРОГРЕС ТА ПОМИЛКИ ---
-async def increment_lessons_completed(pool, user_id):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET lessons_completed = lessons_completed + 1 WHERE telegram_id = $1",
-            user_id
-        )
-
-async def add_mistake(pool, user_id, mistake):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET mistakes = COALESCE(mistakes, '') || $1 || '\n' WHERE telegram_id = $2",
-            mistake, user_id
-        )
-
-async def get_progress(pool, user_id):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT lessons_completed FROM users WHERE telegram_id = $1", user_id
-        )
-        return row["lessons_completed"] if row else 0
-
-async def get_mistakes(pool, user_id):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT mistakes FROM users WHERE telegram_id = $1", user_id
-        )
-        return row["mistakes"] if row and row["mistakes"] else "Помилок поки що не знайдено 👏"
-
-# --- GPT з історією діалогу ---
-async def gpt_call(pool, user_id, prompt, user_level="A2"):
-    memory = await get_memory(pool, user_id, limit=15)
-    messages = [
+# Travel-фрази (приклад, доповнюй темами й текстами)
+TRAVEL_PHRASES = {
+    "hotel": [
         {
-            "role": "system",
-            "content": SYSTEM_PROMPT_UA.replace("{user_level}", user_level),
+            "en": "I'd like to check in, please.",
+            "ua": "Я хочу заселитися, будь ласка.",
+            "tip": "Фраза для реєстрації в готелі."
+        },
+        {
+            "en": "Do you have a reservation?",
+            "ua": "У вас є бронювання?",
+            "tip": "Коли адміністратор питає про бронь."
+        },
+        {
+            "en": "Can I have the Wi-Fi password?",
+            "ua": "Можна пароль від Wi-Fi?",
+            "tip": "Про інтернет у готелі."
+        }
+    ],
+    "taxi": [
+        {
+            "en": "How much does it cost to go to the airport?",
+            "ua": "Скільки коштує доїхати до аеропорту?",
+            "tip": "Уточнюємо ціну у таксиста."
+        },
+        {
+            "en": "Please take me to this address.",
+            "ua": "Відвезіть мене за цією адресою, будь ласка.",
+            "tip": "Показуємо адресу водію."
         }
     ]
-    for row in memory:
-        messages.append({
-            "role": "user" if row["role"] == "user" else "assistant",
-            "content": row["message"],
-        })
-    messages.append({"role": "user", "content": prompt})
+    # Додавай ще теми!
+}
 
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    data = {
-        "model": "gpt-3.5-turbo",
-        "messages": messages,
-        "max_tokens": 350,
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, headers=headers, json=data, timeout=30)
-        answer = resp.json()["choices"][0]["message"]["content"]
-    return answer
+TOPICS_LIST = list(TRAVEL_PHRASES.keys())
 
-# --- HANDLERS ---
+def get_voice_filename(user_id):
+    return f"voice_{user_id}.mp3"
+
+async def send_travel_phrase(update: Update, en, ua, tip):
+    await update.message.reply_text(f"🇬🇧 {en}\n🇺🇦 {ua}\n💡 {tip}")
+    filename = get_voice_filename(update.effective_user.id)
+    tts = gTTS(en, lang='en')
+    tts.save(filename)
+    with open(filename, 'rb') as voice:
+        await update.message.reply_voice(voice)
+    os.remove(filename)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data.get("db_pool")
-    await get_or_create_user(pool, update.effective_user.id, update.effective_user.username)
+    keyboard = [
+        [KeyboardButton("Навчання"), KeyboardButton("Довідник")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
-        "👩‍🏫 Привіт! Я – пані Софія, твоя сучасна викладачка англійської. Всі інструкції — українською, завдання — англійською! "
-        "Використовуй /lesson для початку уроку, /level для зміни рівня, /progress для перегляду успіхів, /mistakes — для твоїх помилок."
+        "Привіт! Я твій travel-бот англійської для подорожей 🌍\n\n"
+        "👉 Хочеш швидко навчитись — обери 'Навчання'.\n"
+        "👉 Хочеш просто знайти потрібну фразу — обери 'Довідник'.",
+        reply_markup=reply_markup
     )
+    context.user_data["mode"] = None
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start – Почати знову\n"
-        "/lesson – Почати урок\n"
-        "/level [A1|A2|B1] – Встановити рівень\n"
-        "/progress – Прогрес\n"
-        "/mistakes – Часті помилки\n"
-        "Надішли будь-яке повідомлення англійською, щоб попрактикуватись!"
-    )
-
-async def lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data.get("db_pool")
-    telegram_id = update.effective_user.id
-    username = update.effective_user.username
-    await get_or_create_user(pool, telegram_id, username)  # ← додано створення юзера
-    level = await get_user_level(pool, telegram_id)
-    prompt = "Give me a simple English lesson with questions and tasks for level " + level
-    reply = await gpt_call(pool, telegram_id, prompt, user_level=level)
-    await update.message.reply_text(reply)
-    await save_memory(pool, telegram_id, "bot", reply)
-    await increment_lessons_completed(pool, telegram_id)
-
-async def level(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data.get("db_pool")
-    telegram_id = update.effective_user.id
-    if context.args and context.args[0] in ["A1", "A2", "B1"]:
-        await update_user_level(pool, telegram_id, context.args[0])
-        await update.message.reply_text(f"Рівень змінено на {context.args[0]}")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+    if text in ["навчання", "/learn"]:
+        context.user_data["mode"] = "learn"
+        context.user_data["learn_topic"] = 0
+        context.user_data["learn_phrase"] = 0
+        await show_next_phrase(update, context)
+    elif text in ["довідник", "/browse"]:
+        context.user_data["mode"] = "browse"
+        await show_topics(update)
+    elif text in TOPICS_LIST:
+        await show_topic_phrases(update, text)
+    elif context.user_data.get("mode") == "learn":
+        await show_next_phrase(update, context)
     else:
-        await update.message.reply_text("Використання: /level A1|A2|B1")
+        # Пошук по ключовому слову
+        await find_phrase(update, text)
 
-async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data.get("db_pool")
-    telegram_id = update.effective_user.id
-    completed = await get_progress(pool, telegram_id)
+async def show_topics(update: Update):
+    topics = [f"• {k.title()}" for k in TOPICS_LIST]
     await update.message.reply_text(
-        f"📈 Твій прогрес:\nВиконано уроків: {completed}\nМолодець! Продовжуй у тому ж дусі!"
+        "Оберіть тему або напишіть її назву англійською чи українською:\n" + "\n".join(topics)
     )
 
-async def mistakes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data.get("db_pool")
-    telegram_id = update.effective_user.id
-    mistakes = await get_mistakes(pool, telegram_id)
-    await update.message.reply_text(
-        f"❗️ Найчастіші твої помилки:\n{mistakes}"
-    )
+async def show_topic_phrases(update: Update, topic):
+    phrases = TRAVEL_PHRASES.get(topic, [])
+    if not phrases:
+        await update.message.reply_text("У цій темі поки що немає фраз.")
+        return
+    for p in phrases:
+        await send_travel_phrase(update, p["en"], p["ua"], p["tip"])
 
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data.get("db_pool")
-    telegram_id = update.effective_user.id
-    prompt = update.message.text
-    level = await get_user_level(pool, telegram_id)
+async def show_next_phrase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic_idx = context.user_data.get("learn_topic", 0)
+    phrase_idx = context.user_data.get("learn_phrase", 0)
+    if topic_idx >= len(TOPICS_LIST):
+        await update.message.reply_text("Ви пройшли всі теми! Пишаємося вами 👏")
+        return
+    topic = TOPICS_LIST[topic_idx]
+    phrases = TRAVEL_PHRASES[topic]
+    if phrase_idx >= len(phrases):
+        context.user_data["learn_topic"] = topic_idx + 1
+        context.user_data["learn_phrase"] = 0
+        await show_next_phrase(update, context)
+        return
+    p = phrases[phrase_idx]
+    await send_travel_phrase(update, p["en"], p["ua"], p["tip"])
+    context.user_data["learn_phrase"] = phrase_idx + 1
 
-    await get_or_create_user(pool, telegram_id, update.effective_user.username)  # ← ще й тут для надійності
-
-    await save_memory(pool, telegram_id, "user", prompt)
-    reply = await gpt_call(pool, telegram_id, prompt, user_level=level)
-    await update.message.reply_text(reply)
-    await save_memory(pool, telegram_id, "bot", reply)
-    if "mistake" in reply.lower():
-        await add_mistake(pool, telegram_id, reply)
+async def find_phrase(update: Update, query):
+    query = query.lower()
+    results = []
+    for topic, phrases in TRAVEL_PHRASES.items():
+        for p in phrases:
+            if query in p["en"].lower() or query in p["ua"].lower():
+                results.append(p)
+    if not results:
+        await update.message.reply_text("Фразу не знайдено. Спробуйте інше слово.")
+    else:
+        for p in results:
+            await send_travel_phrase(update, p["en"], p["ua"], p["tip"])
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
-    async def on_startup(app):
-        pool = await asyncpg.create_pool(DATABASE_URL)
-        app.bot_data["db_pool"] = pool
-
-    app.post_init = on_startup
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("lesson", lesson))
-    app.add_handler(CommandHandler("level", level))
-    app.add_handler(CommandHandler("progress", progress))
-    app.add_handler(CommandHandler("mistakes", mistakes))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling()
 
 if __name__ == "__main__":
